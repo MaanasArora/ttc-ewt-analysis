@@ -78,6 +78,13 @@ def main():
     grouped_stop_route = get_grouped_stopped_records(df)
     ewt = grouped_stop_route[["timestamp"]].apply(calculate_ewt).reset_index(name="ewt")
     ewt = ewt.sort_values("ewt", ascending=False).dropna(subset=["ewt"])
+
+    stops_path = Path("../static_data/stops.txt")
+    if stops_path.exists():
+        stops = pd.read_csv("../static_data/stops.txt")
+        stops["stop_id"] = stops["stop_id"].astype(int)
+        ewt = ewt.merge(stops[["stop_id", "stop_name"]], on="stop_id", how="left")
+        
     ewt.to_csv("ewt_by_stop_route.csv", index=False)
 
     print("Analysis complete. EWT by stop and route saved to ewt_by_stop_route.csv")
