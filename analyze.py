@@ -39,30 +39,54 @@ def get_gtfs_records(files):
     return df
 
 
-def get_grouped_stopped_records(df):
-    stopped = df[df["current_status"] == gtfs_realtime_pb2.VehiclePosition.STOPPED_AT]
+GROUP_COLS = ["stop_id", "route_id", "direction_id"]
+
+
+def get_grouped_stopped_records(df: pd.DataFrame):
+    stopped = df[
+        df["current_status"] == gtfs_realtime_pb2.VehiclePosition.STOPPED_AT
+    ].copy()
     stopped["stop_id"] = stopped["stop_id"].astype(int)
-    stopped = stopped.sort_values("timestamp")
-    stopped = stopped.drop_duplicates(subset=["vehicle_id", "stop_id", "route_id"])
-    stopped["route_id"].value_counts()
-    grouped_stop_route = stopped.groupby(["stop_id", "route_id", "direction_id"])
-    return grouped_stop_route
+    stopped = stopped.sort_values("timestamp").drop_duplicates(
+        subset=["vehicle_id", "stop_id", "route_id"]
+    )
+    return stopped.groupby(GROUP_COLS)
 
 
-def calculate_headways(group):
-    group = group.sort_values("timestamp").copy()
-    group["headway"] = group["timestamp"].diff().dt.total_seconds() / 60
-    return group.dropna(subset=["headway"])
+def calculate_ewt(grouped: pd.core.groupby.DataFrameGroupBy) -> pd.DataFrame:
+    """Compute EWT, headway stats, and record counts per stop/route/direction."""
+    df = grouped.obj  # unwrap to the underlying filtered DataFrame
 
+    headways = (
+        df.sort_values(GROUP_COLS + ["timestamp"])
+        .assign(
+            headway=lambda x: (
+                x.groupby(GROUP_COLS)["timestamp"].diff().dt.total_seconds().div(60)
+            )
+        )
+        .dropna(subset=["headway"])
+    )
 
-def calculate_ewt(group):
-    headways = calculate_headways(group)
+    stats = headways.groupby(GROUP_COLS)["headway"].agg(
+        headway_mean="mean",
+        headway_var="var",
+        headway_count="count",
+    )
 
-    avg_wt = headways["headway"].mean()
-    var_wt = headways["headway"].var()
+    stats["ewt"] = stats["headway_var"] / (
+        2
+        * stats["headway_mean"]
+        .where(stats["headway_mean"] > 0)
+        .where(stats["headway_count"] >= 8)
+    )
 
-    ewt = var_wt / (2 * avg_wt) if avg_wt > 0 else None
-    return ewt
+    # Record counts from the original (pre-headway-diff) stopped records
+    record_counts = grouped.size().rename("record_count")
+
+    return stats.join(record_counts).reset_index()[
+        GROUP_COLS
+        + ["ewt", "headway_mean", "headway_var", "headway_count", "record_count"]
+    ]
 
 
 def main():
@@ -70,23 +94,26 @@ def main():
 
     min_time = min(f.stat().st_mtime for f in files)
     max_time = max(f.stat().st_mtime for f in files)
-    duration = (max_time - min_time) / 60  # convert to minutes
+    duration = (max_time - min_time) / 60
 
     print(f"Found {len(files)} files created over a duration of {duration:.2f} minutes")
 
     df = get_gtfs_records(files)
     grouped_stop_route = get_grouped_stopped_records(df)
-    ewt = grouped_stop_route[["timestamp"]].apply(calculate_ewt).reset_index(name="ewt")
-    ewt = ewt.sort_values("ewt", ascending=False).dropna(subset=["ewt"])
+
+    ewt = (
+        calculate_ewt(grouped_stop_route)
+        .sort_values("ewt", ascending=False)
+        .dropna(subset=["ewt"])
+    )
 
     stops_path = Path("../static_data/stops.txt")
     if stops_path.exists():
-        stops = pd.read_csv("../static_data/stops.txt")
+        stops = pd.read_csv(stops_path)
         stops["stop_id"] = stops["stop_id"].astype(int)
         ewt = ewt.merge(stops[["stop_id", "stop_name"]], on="stop_id", how="left")
-        
-    ewt.to_csv("ewt_by_stop_route.csv", index=False)
 
+    ewt.to_csv("ewt_by_stop_route.csv", index=False)
     print("Analysis complete. EWT by stop and route saved to ewt_by_stop_route.csv")
 
 
